@@ -616,6 +616,15 @@ class Host(object):
         return libvirt_guest.Guest(
             self.get_domain(instance))
 
+    def get_vtpm(self, instance):
+        """Derive VTPM Domain object
+
+        Assumes that name can be derived from the instance name
+        """
+        vtpm_name = instance.name.replace('instance', 'vtpm')
+        return libvirt_guest.Guest(
+            self._get_domain_by_name(vtpm_name))
+
     def _get_domain_by_id(self, instance_id):
         """Retrieve libvirt domain object given an instance id.
 

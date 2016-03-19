@@ -1,3 +1,9 @@
+EC500 Adding VTPM Support to OpenStack
+=====================
+We have added support to the Nova compute service for provisioning
+VTPMs on Xen hypervisors via a modified libvirt.
+
+
 OpenStack Nova README
 =====================
 

@@ -896,6 +896,9 @@ class LibvirtDriver(driver.ComputeDriver):
     def _destroy(self, instance, attempt=1):
         try:
             guest = self._host.get_guest(instance)
+            # Destroy the vtpm associated with this instance if it exists
+            # We need to derive its existance from the instance object
+            vtpm = self._host.get_vtpm(instance)
         except exception.InstanceNotFound:
             guest = None
 
@@ -905,8 +908,9 @@ class LibvirtDriver(driver.ComputeDriver):
         if guest is not None:
             try:
                 old_domid = guest.id
+                # We need to destroy the guest before the VTPM
                 guest.poweroff()
-
+                vtpm.poweroff()
             except libvirt.libvirtError as e:
                 is_okay = False
                 errcode = e.get_error_code()
@@ -1026,7 +1030,9 @@ class LibvirtDriver(driver.ComputeDriver):
     def _undefine_domain(self, instance):
         try:
             guest = self._host.get_guest(instance)
+            vtpm = self._host.get_vtpm(instance)
             try:
+                vtpm.delete_configuration()
                 guest.delete_configuration()
             except libvirt.libvirtError as e:
                 with excutils.save_and_reraise_exception():
@@ -1120,6 +1126,10 @@ class LibvirtDriver(driver.ComputeDriver):
                 self._cleanup_lvm(instance, block_device_info)
             if CONF.libvirt.images_type == 'rbd':
                 self._cleanup_rbd(instance)
+
+        # Delete the VTPM's backing image
+        vtpm_name = instance.name.replace('instance', 'vtpm')
+        self._delete_vtpm_image(vtpm_name)
 
         is_shared_block_storage = False
         if migrate_data and 'is_shared_block_storage' in migrate_data:
@@ -2756,10 +2766,17 @@ class LibvirtDriver(driver.ComputeDriver):
                            block_device_info=block_device_info,
                            files=injected_files,
                            admin_pass=admin_password)
+
         xml = self._get_guest_xml(context, instance, network_info,
                                   disk_info, image_meta,
                                   block_device_info=block_device_info,
                                   write_to_disk=True)
+
+        # Create the VTPM here
+        # This is probably where we need to create the backing image as well
+        # The instance object should also be updated with the VTPM UUID
+        self._create_vtpm_domain(instance)
+
         self._create_domain_and_network(context, xml, instance, network_info,
                                         disk_info,
                                         block_device_info=block_device_info)
@@ -4484,6 +4501,47 @@ class LibvirtDriver(driver.ComputeDriver):
                 cpu_config.features.add(xf)
         return cpu_config
 
+    def _get_vtpm_config(self, name, uuid, vtpm_image_path):
+        """Get a config for stub vtpm domains
+        This builds up a hard coded libvirt configuration for vtpm stubs
+        """
+        vtpm_config = vconfig.LibvirtConfigGuest()
+        virt_type = 'xen'
+        vtpm_config.virt_type = virt_type
+        vtpm_config.name = name
+        vtpm_config.uuid = uuid
+        vtpm_config.memory = 8192
+        vtpm_config.vcpus = 1
+        os_type = 'linux'
+        vtpm_config.os_type = os_type
+        vtpm_config.os_mach_type = 'xenpv'
+        # Verify that this is always the path, otherwise make it configurable
+        vtpm_config.os_kernel = '/var/lib/xen/vtpm-kernel/vtpm-stubdom.gz'
+        vtpm_config.os_cmdline = 'loglevel=debug'
+
+        clock_config = vconfig.LibvirtConfigGuestClock()
+        clock_config.adjustment = 'reset'
+        vtpm_config.set_clock(clock_config)
+
+        disk_config = vconfig.LibvirtConfigGuestDisk()
+        disk_config.driver_name = 'file'
+        disk_config.source_path = vtpm_image_path
+        disk_config.target_dev = 'hda'
+        disk_config.target_bus = 'xen'
+        vtpm_config.add_device(disk_config)
+
+        console_config = vconfig.LibvirtConfigGuestConsole()
+        console_config.target_type = 'xen'
+        console_config.target_port = '0'
+        vtpm_config.add_device(console_config)
+
+        vtpm_device = vconfig.LibvirtConfigGuestVtpm()
+        vtpm_device.backend = 'vtpmmgr'
+        vtpm_device.uuid = uuid
+        vtpm_config.add_device(vtpm_device)
+
+        return vtpm_config
+
     def _get_guest_config(self, instance, network_info, image_meta,
                           disk_info, rescue=None, block_device_info=None,
                           context=None):
@@ -4659,6 +4717,10 @@ class LibvirtDriver(driver.ComputeDriver):
             balloon.period = CONF.libvirt.mem_stats_period_seconds
             guest.add_device(balloon)
 
+        vtpm_device = vconfig.LibvirtConfigGuestVtpm()
+        vtpm_device.backend = guest.name.replace('instance', 'vtpm')
+        guest.add_device(vtpm_device)
+
         return guest
 
     def _get_guest_usb_tablet(self, os_type):
@@ -4682,6 +4744,19 @@ class LibvirtDriver(driver.ComputeDriver):
             tablet.type = "tablet"
             tablet.bus = "usb"
         return tablet
+
+    def _get_vtpm_xml(self, name, uuid, vtpm_image_path):
+        '''Gets a libvirt configuration file for vtpm stub domains
+        -Create the static conf object
+        -convert it to xml and return that object
+        '''
+
+        conf = self._get_vtpm_config(name, uuid, vtpm_image_path)
+        xml = conf.to_xml()
+
+        LOG.debug('End _get_vtpm_xml xml=%(xml)s',
+                  {'xml': xml})
+        return xml
 
     def _get_guest_xml(self, context, instance, network_info, disk_info,
                        image_meta, rescue=None,
@@ -4851,6 +4926,53 @@ class LibvirtDriver(driver.ComputeDriver):
         # already up so we don't block on it.
         return [('network-vif-plugged', vif['id'])
                 for vif in network_info if vif.get('active', True) is False]
+
+    def _request_vtpm_uuid(self):
+        """Request a UUID from the vtpmmgr domain
+        TODO: The request URL needs to point to our REST API
+        """
+        import oslo_serialization.jsonutils as jsonutils
+        import urllib2
+        request_url = "http://keylime_vm:8081"
+        request = urllib2.urlopen(request_url)
+        status_code = request.getcode()
+        if(status_code == 200):
+            json_str = request.read()
+            uuid = jsonutils.loads(json_str)['uuid']
+        else:
+            raise exception.VtpmFailure(status_code=str(status_code))
+        return uuid
+
+    def _create_vtpm_image(self, vtpm_name):
+        """Creates the backing image for the VTPM
+        This creates a 2MB image for the VTPM's storage
+        There are a lot of bad assumptions made so refactor in the future
+        For hacking purposes, I gave everything involved o+rwx permissions
+        """
+        from subprocess import call
+        vtpm_image_path = '/var/lib/xen/images/nova_vtpms/%s.img' % vtpm_name
+        call(['dd', 'if=/dev/zero', 'of=%s' % vtpm_image_path, 'bs=1024',
+          'count=2048'])
+
+        call(['chmod', 'o+rwx', vtpm_image_path])
+        return vtpm_image_path
+
+    def _delete_vtpm_image(self, vtpm_name):
+        from subprocess import call
+        vtpm_image_path = '/var/lib/xen/images/nova_vtpms/%s.img' % vtpm_name
+        call(['rm', vtpm_image_path])
+        return vtpm_image_path
+
+    def _create_vtpm_domain(self, instance):
+        # Derive the vtpm name from the host name
+        # It ends up looking like instance-00000001 and vtpm-00000001
+        vtpm_name = instance.name.replace('instance', 'vtpm')
+        vtpm_uuid = self._request_vtpm_uuid()
+        vtpm_image_path = self._create_vtpm_image(vtpm_name)
+
+        vtpm_xml = self._get_vtpm_xml(vtpm_name, vtpm_uuid, vtpm_image_path)
+
+        self._create_domain(vtpm_xml, power_on=True, pause=False)
 
     def _create_domain_and_network(self, context, xml, instance, network_info,
                                    disk_info, block_device_info=None,

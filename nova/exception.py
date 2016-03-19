@@ -162,6 +162,10 @@ class NovaException(Exception):
         return self.args[0]
 
 
+class VtpmFailure(NovaException):
+    msg_fmt = _("Failed to request VTPM UUID status code: %(status_code)s")
+
+
 class EncryptionFailure(NovaException):
     msg_fmt = _("Failed to encrypt text: %(reason)s")
 

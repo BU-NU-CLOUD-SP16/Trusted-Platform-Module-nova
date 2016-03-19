@@ -702,6 +702,23 @@ class LibvirtConfigGuestDevice(LibvirtConfigObject):
         super(LibvirtConfigGuestDevice, self).__init__(**kwargs)
 
 
+class LibvirtConfigGuestVtpm(LibvirtConfigGuestDevice):
+    def __init__(self, **kwargs):
+        super(LibvirtConfigGuestVtpm, self).__init__(root_name="vtpm",
+                                                        **kwargs)
+
+        self.backend = ""
+        self.uuid = ""
+
+    def format_dom(self):
+        dev = super(LibvirtConfigGuestVtpm, self).format_dom()
+
+        dev.set("backend", self.backend)
+        if self.uuid is not "":
+            dev.set("uuid", self.uuid)
+        return dev
+
+
 class LibvirtConfigGuestDisk(LibvirtConfigGuestDevice):
 
     def __init__(self, **kwargs):
